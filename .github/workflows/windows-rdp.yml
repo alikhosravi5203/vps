@@ -6,52 +6,160 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 350
 
     steps:
+
+      # 1. Enable Remote Desktop
       - name: 1. Enable Remote Desktop & Firewall
+        shell: powershell
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+          Write-Host "Enabling Remote Desktop..."
 
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0
+
+          Set-Service -Name 'TermService' -StartupType Automatic
+          Start-Service -Name 'TermService'
+
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+
+          Write-Host "Remote Desktop enabled successfully."
+
+
+      # 2. Create RDP Administrator
       - name: 2. Create Admin Account
+        shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
-          New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
-          net user runneradmin Cynet@2026
+          Write-Host "Creating RDP account..."
 
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            Write-Error "RDP_PASSWORD secret is not configured."
+            exit 1
+          }
+
+          $Password = ConvertTo-SecureString `
+            $env:RDP_PASSWORD `
+            -AsPlainText `
+            -Force
+
+          $User = Get-LocalUser -Name 'CynetAdmin' -ErrorAction SilentlyContinue
+
+          if ($null -eq $User) {
+            New-LocalUser `
+              -Name 'CynetAdmin' `
+              -Password $Password `
+              -PasswordNeverExpires `
+              -AccountNeverExpires
+
+            Write-Host "User CynetAdmin created."
+          }
+          else {
+            Set-LocalUser `
+              -Name 'CynetAdmin' `
+              -Password $Password
+
+            Write-Host "User CynetAdmin already existed. Password updated."
+          }
+
+          $IsAdmin = Get-LocalGroupMember `
+            -Group 'Administrators' `
+            -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like '*\CynetAdmin' }
+
+          if ($null -eq $IsAdmin) {
+            Add-LocalGroupMember `
+              -Group 'Administrators' `
+              -Member 'CynetAdmin'
+
+            Write-Host "CynetAdmin added to Administrators."
+          }
+          else {
+            Write-Host "CynetAdmin is already an Administrator."
+          }
+
+
+      # 3. Install Tailscale
       - name: 3. Install & Connect Tailscale VPN
+        shell: powershell
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          # Download and install Tailscale silently
-          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
-          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
-          
-          # Connect to Tailscale network
-          Start-Sleep -Seconds 5
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server"
-          
-          Start-Sleep -Seconds 8
-          
-          # Get Tailscale IP
-          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-          
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
-          Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
-          Write-Host "  Username     : CynetAdmin" -ForegroundColor Yellow
-          Write-Host "  Password     : Cynet@2026" -ForegroundColor Yellow
-          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
-          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "Downloading Tailscale..."
 
-      - name: 4. Keep Server Alive (6 Hours)
-        run: |
-          for ($i = 1; $i -le 360; $i++) {
-            Start-Sleep -Seconds 60
-            Write-Host "[$i/360] Server running..."
+          $Installer = 'C:\tailscale.msi'
+
+          Invoke-WebRequest `
+            -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' `
+            -OutFile $Installer
+
+          Write-Host "Installing Tailscale..."
+
+          Start-Process `
+            -FilePath 'msiexec.exe' `
+            -ArgumentList "/i `"$Installer`" /quiet /norestart" `
+            -Wait `
+            -NoNewWindow
+
+          $Tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
+
+          if (-not (Test-Path $Tailscale)) {
+            Write-Error "Tailscale executable was not found."
+            exit 1
           }
 
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+            Write-Error "TAILSCALE_AUTHKEY secret is not configured."
+            exit 1
+          }
+
+          Write-Host "Connecting to Tailscale..."
+
+          & $Tailscale up `
+            --authkey="$env:TAILSCALE_AUTHKEY" `
+            --hostname="github-rdp-server"
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Tailscale connection failed."
+            exit 1
+          }
+
+          Start-Sleep -Seconds 8
+
+          $tsIp = (& $Tailscale ip -4 | Select-Object -First 1).Trim()
+
+          if ([string]::IsNullOrWhiteSpace($tsIp)) {
+            Write-Error "Could not obtain Tailscale IPv4 address."
+            exit 1
+          }
+
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "          RDP SERVER IS READY" -ForegroundColor Cyan
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "Tailscale IP : $tsIp" -ForegroundColor Yellow
+          Write-Host "Username     : CynetAdmin" -ForegroundColor Yellow
+          Write-Host "Password     : Stored in GitHub Secret" -ForegroundColor Yellow
+          Write-Host ""
+          Write-Host "Open Windows Remote Desktop (mstsc.exe)"
+          Write-Host "and connect to:"
+          Write-Host $tsIp -ForegroundColor Magenta
+          Write-Host "==================================================" -ForegroundColor Green
+
+
+      # 4. Keep Server Alive
+      - name: 4. Keep Server Alive
+        shell: powershell
+        run: |
+          Write-Host "Keeping server alive..."
+
+          for ($i = 1; $i -le 330; $i++) {
+            Start-Sleep -Seconds 60
+            Write-Host "[$i/330] Server running..."
+          }
+
+          Write-Host "Keep-alive period completed."
